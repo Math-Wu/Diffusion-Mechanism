@@ -1,0 +1,43 @@
+run:
+  name: cifar_dit_s0_medium
+  seed: 0
+  output_dir: outputs/cifar_dit_s0_medium
+data:
+  name: cifar10
+  root: data
+  image_size: 32
+  train_size: 45000
+  val_size: 5000
+  split_seed: 20260423
+  num_workers: 4
+model:
+  architecture: dit
+  in_channels: 3
+  image_size: 32
+  patch_size: 2
+  hidden_size: 384
+  depth: 10
+  num_heads: 6
+  mlp_ratio: 4
+  dropout: 0.0
+diffusion:
+  schedule: cosine
+  eps: 0.001
+training:
+  batch_size: 256
+  images_seen: 50000000
+  checkpoint_images: 5000000
+  lr: 0.0002
+  warmup_steps: 5000
+  weight_decay: 0.01
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  log_interval: 100
+  amp: bf16
+sampling:
+  nfe: [4, 6, 8, 10, 15, 20, 35, 50]
+  num_samples: 10000
+  batch_size: 256
+  reference_solver: heun
+  reference_nfe: 256
+  noise_seed: 12345
