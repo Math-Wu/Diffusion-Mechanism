@@ -3,12 +3,11 @@ from __future__ import annotations
 import argparse
 import itertools
 
-import torch
-
 from _bootstrap import add_src_to_path
 
 add_src_to_path()
 
+from dm.config import load_config
 from dm.data import build_cifar10_loaders
 from dm.eval_utils import (
     default_noise_bank_path,
@@ -16,20 +15,14 @@ from dm.eval_utils import (
     load_or_compute_real_stats,
     load_or_create_noise_bank,
     noise_bank_id,
-    noise_batches,
 )
-from dm.experiment import build_schedule, load_model_from_checkpoint
-from dm.metrics import build_feature_extractor, collect_features, feature_stats, frechet_distance
-from dm.samplers import sample
+from dm.metrics import build_feature_extractor
 from dm.utils import default_device, set_seed
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--solver", required=True)
-    parser.add_argument("--nfe", type=int, required=True)
     parser.add_argument("--num_samples", type=int, default=10000)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=12345)
@@ -40,33 +33,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-@torch.no_grad()
-def generated_batches(model, schedule, solver: str, nfe: int, batch_size: int, noise_bank: torch.Tensor, device):
-    for noise in noise_batches(noise_bank, batch_size, device):
-        result = sample(model, schedule, noise, solver=solver, nfe=nfe)
-        yield result.samples
-
-
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
-    device = default_device()
-    model, config, _ = load_model_from_checkpoint(args.config, args.checkpoint, device, use_ema=True)
+    config = load_config(args.config)
     config["training"]["batch_size"] = args.batch_size
-    _, val_loader = build_cifar10_loaders(config, download=False)
-    schedule = build_schedule(config)
-    extractor = build_feature_extractor(args.feature_backend, device, args.allow_pixel_fallback)
+    device = default_device()
+
     image_size = int(config["data"].get("image_size", config["model"].get("image_size", 32)))
     noise_shape = (int(config["model"]["in_channels"]), image_size, image_size)
     noise_path = args.noise_bank or default_noise_bank_path(config["data"].get("root", "data"), args.seed, args.num_samples, noise_shape)
-    noise_bank = load_or_create_noise_bank(noise_path, num_samples=args.num_samples, shape=noise_shape, seed=args.seed)
+    load_or_create_noise_bank(noise_path, num_samples=args.num_samples, shape=noise_shape, seed=args.seed)
+
+    _, val_loader = build_cifar10_loaders(config, download=False)
+    extractor = build_feature_extractor(args.feature_backend, device, args.allow_pixel_fallback)
     real_stats_path = args.real_stats_cache or default_real_stats_path(
         config["data"].get("root", "data"),
         split_seed=int(config["data"].get("split_seed", 20260423)),
         num_samples=args.num_samples,
         feature_backend=args.feature_backend,
     )
-    real_stats = load_or_compute_real_stats(
+    load_or_compute_real_stats(
         real_stats_path,
         itertools.cycle(val_loader),
         extractor,
@@ -79,16 +66,8 @@ def main() -> None:
             "num_samples": args.num_samples,
         },
     )
-    fake = collect_features(
-        generated_batches(model, schedule, args.solver, args.nfe, args.batch_size, noise_bank, device),
-        extractor,
-        device,
-        args.num_samples,
-    )
-    fid = frechet_distance(real_stats, feature_stats(fake))
     print(
-        f"fid={fid:.6f} solver={args.solver} nfe={args.nfe} samples={args.num_samples} "
-        f"noise_bank_id={noise_bank_id(noise_path)} real_stats={real_stats_path}",
+        f"noise_bank={noise_path} noise_bank_id={noise_bank_id(noise_path)} real_stats_cache={real_stats_path}",
         flush=True,
     )
 
