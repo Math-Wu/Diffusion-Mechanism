@@ -45,16 +45,16 @@ class AttentionBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = x.shape
-        h = self.norm(x).view(batch, channels, height * width)
+        h = self.norm(x).reshape(batch, channels, height * width)
         q, k, v = self.qkv(h).chunk(3, dim=1)
         head_dim = channels // self.num_heads
-        q = q.view(batch * self.num_heads, head_dim, height * width).transpose(1, 2)
-        k = k.view(batch * self.num_heads, head_dim, height * width)
-        v = v.view(batch * self.num_heads, head_dim, height * width).transpose(1, 2)
+        q = q.reshape(batch * self.num_heads, head_dim, height * width).transpose(1, 2)
+        k = k.reshape(batch * self.num_heads, head_dim, height * width)
+        v = v.reshape(batch * self.num_heads, head_dim, height * width).transpose(1, 2)
         weight = torch.bmm(q, k) * (head_dim ** -0.5)
         weight = torch.softmax(weight, dim=-1)
         out = torch.bmm(weight, v).transpose(1, 2).reshape(batch, channels, height * width)
-        out = self.proj(out).view(batch, channels, height, width)
+        out = self.proj(out).reshape(batch, channels, height, width)
         return x + out
 
 
