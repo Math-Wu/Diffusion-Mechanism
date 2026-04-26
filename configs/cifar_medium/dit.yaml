@@ -1,7 +1,7 @@
 run:
-  name: cifar_dit_s0_medium
+  name: cifar_dit_s0_medium_d10_h640
   seed: 0
-  output_dir: outputs/cifar_dit_s0_medium
+  output_dir: outputs/cifar_dit_s0_medium_d10_h640
 data:
   name: cifar10
   root: data
@@ -15,9 +15,9 @@ model:
   in_channels: 3
   image_size: 32
   patch_size: 2
-  hidden_size: 384
+  hidden_size: 640
   depth: 10
-  num_heads: 6
+  num_heads: 10
   mlp_ratio: 4
   dropout: 0.0
 diffusion:
