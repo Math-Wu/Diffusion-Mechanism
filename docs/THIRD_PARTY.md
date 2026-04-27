@@ -14,10 +14,11 @@ inspectable, while following the public designs below.
 - UniPC: sampler interface and naming follow `wl-zhao/UniPC` (MIT licensed).
   The local implementation uses the shared VP ODE wrapper in this repository
   for unified NFE accounting.
-- DEIS: sampler interface and naming follow `qsh-zh/deis`. The local
-  implementation uses a compact exponential/multistep-inspired update over the
-  shared VP ODE wrapper.
+- DEIS: sampler interface and the `t_ab` exponential-integrator update follow
+  the official `qsh-zh/deis` PyTorch implementation. The local implementation
+  reimplements the official VPSDE coefficient construction in pure PyTorch so
+  it does not require JAX at evaluation time.
 
-Before using this scaffold for paper-grade numbers, replace the compact
-sampler kernels with line-by-line vendored official implementations or add a
-numerical parity test against those repositories.
+Before using this scaffold for paper-grade numbers, replace the remaining
+compact sampler kernels with line-by-line vendored official implementations or
+add numerical parity tests against those repositories.
