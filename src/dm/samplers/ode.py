@@ -13,7 +13,7 @@ AB_COEFFS = {
 }
 
 
-_DEIS_T_AB_CACHE: dict[tuple[float, float, int, int, float, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_DEIS_AB_CACHE: dict[tuple[str, float, float, int, int, float, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
 def _batch_time(value: torch.Tensor, batch: int) -> torch.Tensor:
@@ -125,8 +125,10 @@ class DEISTABSampler(BaseSampler):
             self.ts_order,
             self.integration_points,
         )
-        if key in _DEIS_T_AB_CACHE:
-            return _DEIS_T_AB_CACHE[key]
+        cache_key = ("t_ab", *key)
+        if cache_key in _DEIS_AB_CACHE:
+            times, coefs, _ = _DEIS_AB_CACHE[cache_key]
+            return times, coefs
 
         times = self._official_time_grid(nfe)
         x_coef = torch.empty(nfe, dtype=torch.float64)
@@ -156,8 +158,9 @@ class DEISTABSampler(BaseSampler):
                     basis = basis * (t_inter - ts_poly[basis_idx]) / denominator
                 eps_coef[step, history_index] = (integrand * basis).sum() * dt
 
-        _DEIS_T_AB_CACHE[key] = (times.float(), torch.cat([x_coef[:, None], eps_coef], dim=1).float())
-        return _DEIS_T_AB_CACHE[key]
+        coefs = torch.cat([x_coef[:, None], eps_coef], dim=1).float()
+        _DEIS_AB_CACHE[cache_key] = (times.float(), coefs, torch.empty(0))
+        return times.float(), coefs
 
     @torch.no_grad()
     def sample(self, model: EpsModel, x: torch.Tensor, nfe: int) -> SamplerResult:
@@ -178,3 +181,94 @@ class DEISTABSampler(BaseSampler):
             x = x_next
             history = [eps, *history[: self.order - 1]]
         return SamplerResult(samples=x, nfe=counted.nfe)
+
+
+class DEISRhoABSampler(BaseSampler):
+    """DEIS rhoAB sampler from qsh-zh/deis v1, adapted to epsilon prediction."""
+
+    name = "deis"
+
+    def __init__(self, schedule, order: int = 3, ts_order: float = 2.0, integration_points: int = 10_000):
+        super().__init__(schedule)
+        self.order = int(order)
+        self.ts_order = float(ts_order)
+        self.integration_points = int(integration_points)
+
+    def _time_grid_from_rho(self, rhos: torch.Tensor) -> torch.Tensor:
+        log_snr = -2.0 * rhos.clamp_min(1e-12).log()
+        return self.schedule.inverse_log_snr(log_snr).double()
+
+    def _rho_time_grid(self, nfe: int) -> tuple[torch.Tensor, torch.Tensor]:
+        endpoints = torch.tensor([1.0 - self.schedule.eps, self.schedule.eps], dtype=torch.float64)
+        alpha, sigma = self.schedule.alpha_sigma(endpoints)
+        rho_hi = sigma[0] / alpha[0].clamp_min(1e-12)
+        rho_lo = sigma[1] / alpha[1].clamp_min(1e-12)
+        base = torch.linspace(
+            rho_hi.pow(1.0 / self.ts_order),
+            rho_lo.pow(1.0 / self.ts_order),
+            nfe + 1,
+            dtype=torch.float64,
+        )
+        rhos = base.pow(self.ts_order).clamp_min(1e-12)
+        return self._time_grid_from_rho(rhos), rhos
+
+    def _coefficients(self, nfe: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (
+            "rho_ab",
+            float(self.schedule.eps),
+            float(getattr(self.schedule, "s", 0.008)),
+            nfe,
+            self.order,
+            self.ts_order,
+            self.integration_points,
+        )
+        if key in _DEIS_AB_CACHE:
+            return _DEIS_AB_CACHE[key]
+
+        times, rhos = self._rho_time_grid(nfe)
+        eps_coef = torch.zeros(nfe, self.order + 1, dtype=torch.float64)
+        for step in range(nfe):
+            current_order = min(self.order, step)
+            rho_start = rhos[step]
+            rho_end = rhos[step + 1]
+            rho_poly = rhos[step - current_order : step + 1]
+            drho = (rho_end - rho_start) / self.integration_points
+            rho_inter = rho_start + torch.arange(self.integration_points, dtype=torch.float64) * drho
+
+            for history_index in range(current_order + 1):
+                coef_idx = current_order - history_index
+                basis = torch.ones_like(rho_inter)
+                for basis_idx in range(current_order + 1):
+                    if basis_idx == coef_idx:
+                        continue
+                    denominator = rho_poly[coef_idx] - rho_poly[basis_idx]
+                    basis = basis * (rho_inter - rho_poly[basis_idx]) / denominator
+                eps_coef[step, history_index] = basis.sum() * drho
+
+        cached = (times.float(), eps_coef.float(), rhos.float())
+        _DEIS_AB_CACHE[key] = cached
+        return cached
+
+    @torch.no_grad()
+    def sample(self, model: EpsModel, x: torch.Tensor, nfe: int) -> SamplerResult:
+        counted = CountedModel(model)
+        times_cpu, coef_cpu, _ = self._coefficients(nfe)
+        times = times_cpu.to(device=x.device, dtype=x.dtype)
+        coefs = coef_cpu.to(device=x.device, dtype=x.dtype)
+        alpha, _ = self.schedule.alpha_sigma(times)
+        alpha = alpha.to(device=x.device, dtype=x.dtype)
+        batch = x.shape[0]
+        v = x / alpha[0].clamp_min(1e-12).view(*([1] * x.ndim))
+        history: list[torch.Tensor] = []
+        for index in range(nfe):
+            t = _batch_time(times[index], batch)
+            x_t = alpha[index].view(*([1] * x.ndim)) * v
+            eps = counted(x_t, t)
+            step_coef = coefs[index]
+            v_next = v
+            for coef, eps_pred in zip(step_coef, [eps, *history]):
+                v_next = v_next + coef.view(*([1] * x.ndim)) * eps_pred
+            v = v_next
+            history = [eps, *history[: self.order - 1]]
+        samples = alpha[-1].view(*([1] * x.ndim)) * v
+        return SamplerResult(samples=samples, nfe=counted.nfe)

@@ -14,10 +14,12 @@ inspectable, while following the public designs below.
 - UniPC: sampler interface and naming follow `wl-zhao/UniPC` (MIT licensed).
   The local implementation uses the shared VP ODE wrapper in this repository
   for unified NFE accounting.
-- DEIS: sampler interface and the `t_ab` exponential-integrator update follow
+- DEIS: sampler interface and the `rho_ab` exponential-integrator update follow
   the official `qsh-zh/deis` PyTorch implementation. The local implementation
   reimplements the official VPSDE coefficient construction in pure PyTorch so
-  it does not require JAX at evaluation time.
+  it does not require JAX at evaluation time. A `t_ab` implementation is kept
+  in the sampler module for parity/debugging, but `rho_ab` is the default
+  because it is more stable for this CIFAR cosine-VP setup.
 
 Before using this scaffold for paper-grade numbers, replace the remaining
 compact sampler kernels with line-by-line vendored official implementations or

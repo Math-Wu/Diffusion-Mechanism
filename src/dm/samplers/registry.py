@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from dm.samplers.base import EpsModel, SamplerResult
-from dm.samplers.ode import DDIMSampler, DEISTABSampler, HeunSampler, MultistepODESampler
+from dm.samplers.ode import DDIMSampler, DEISRhoABSampler, HeunSampler, MultistepODESampler
 from dm.schedules import CosineVPSchedule
 
 
@@ -17,7 +17,7 @@ def build_sampler(name: str, schedule: CosineVPSchedule):
     if key == "heun":
         return HeunSampler(schedule)
     if key == "deis":
-        return DEISTABSampler(schedule, order=3, ts_order=2.0)
+        return DEISRhoABSampler(schedule, order=3, ts_order=2.0)
     if key == "dpmpp":
         return MultistepODESampler(schedule, name="dpmpp", max_order=2, damping=1.0)
     if key == "unipc":
