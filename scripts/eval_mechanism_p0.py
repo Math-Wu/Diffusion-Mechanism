@@ -4,7 +4,6 @@ import argparse
 import csv
 import math
 import os
-from collections import defaultdict
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/dm_matplotlib")
@@ -18,9 +17,8 @@ from _bootstrap import add_src_to_path
 
 add_src_to_path()
 
-from dm.analysis import fft_radial_band_energy, logsnr_bin_centers, logsnr_bin_index, radial_band_spec
+from dm.analysis import fft_radial_band_energy, logsnr_bin_centers, radial_band_spec
 from dm.data import build_cifar10_loaders
-from dm.eval_utils import default_noise_bank_path, load_or_create_noise_bank, noise_batches
 from dm.experiment import build_schedule, checkpoint_path_for_run, load_model_from_checkpoint
 from dm.samplers import SAMPLERS
 from dm.utils import default_device, ensure_dir, set_seed
@@ -41,13 +39,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--solvers", nargs="+", default=["ddim", "heun", "dpmpp", "unipc"], choices=SAMPLERS)
     parser.add_argument("--nfe", nargs="+", type=int, default=[8, 15, 20, 50])
     parser.add_argument("--num_data", type=int, default=512)
-    parser.add_argument("--num_noise", type=int, default=128)
+    parser.add_argument(
+        "--num_noise",
+        type=int,
+        default=128,
+        help="Legacy name: number of held-out q-path examples for fixed-bin local-error probes.",
+    )
+    parser.add_argument("--num_error", type=int, dest="num_noise")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--time_bins", type=int, default=16)
     parser.add_argument("--freq_bands", type=int, default=8)
     parser.add_argument("--ref_substeps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--noise_bank")
+    parser.add_argument("--noise_bank", help=argparse.SUPPRESS)
     parser.add_argument("--raw_weights", action="store_true")
     return parser.parse_args()
 
@@ -94,72 +98,94 @@ def reference_heun_integrate(model, schedule, x: torch.Tensor, t_start: torch.Te
     return current
 
 
-def _solver_times(schedule, solver: str, nfe: int, device: torch.device) -> torch.Tensor:
-    if solver == "heun":
-        intervals = max(1, (nfe + 1) // 2)
-        return schedule.time_grid(intervals, device)
-    return schedule.time_grid(nfe, device)
+def _logsnr_bounds(schedule, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    t_hi = torch.tensor(1.0 - schedule.eps, device=device)
+    t_lo = torch.tensor(schedule.eps, device=device)
+    return schedule.log_snr(t_hi), schedule.log_snr(t_lo)
+
+
+def _macro_intervals(solver: str, nfe: int) -> int:
+    return max(1, (nfe + 1) // 2) if solver == "heun" else max(1, nfe)
 
 
 @torch.no_grad()
-def run_solver_error_map(
+def run_fixed_bin_solver_error_map(
     model,
     schedule,
-    x: torch.Tensor,
+    val_loader,
     solver: str,
     nfe: int,
+    device: torch.device,
+    num_examples: int,
     time_bins: int,
     band_spec,
     ref_substeps: int,
-) -> tuple[np.ndarray, np.ndarray]:
+    seed: int,
+) -> np.ndarray:
     if solver not in {"ddim", "heun", "dpmpp", "unipc"}:
         raise ValueError(f"Unsupported P0 solver: {solver}")
-    times = _solver_times(schedule, solver, nfe, x.device)
-    sums = torch.zeros(time_bins, band_spec.masks.shape[0], device=x.device)
-    counts = torch.zeros(time_bins, device=x.device)
-    history: list[torch.Tensor] = []
+    lambda_hi, lambda_lo = _logsnr_bounds(schedule, device)
+    edges = torch.linspace(lambda_hi, lambda_lo, time_bins + 1, device=device)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    lambda_step = (lambda_lo - lambda_hi) / _macro_intervals(solver, nfe)
+    sums = torch.zeros(time_bins, band_spec.masks.shape[0], device=device)
+    counts = torch.zeros(time_bins, device=device)
     max_order = 2 if solver == "dpmpp" else 3
-    remaining = nfe
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    seen = 0
 
-    for index in range(times.numel() - 1):
-        t = _batch_time(times[index], x.shape[0])
-        t_next = _batch_time(times[index + 1], x.shape[0])
-        x_ref = reference_heun_integrate(model, schedule, x, t, t_next, ref_substeps)
+    for batch in val_loader:
+        if seen >= num_examples:
+            break
+        x0 = batch[0].to(device)
+        if seen + x0.shape[0] > num_examples:
+            x0 = x0[: num_examples - seen]
+        seen += x0.shape[0]
+        path_noise = torch.randn(x0.shape, device=device, generator=generator)
 
-        if solver == "ddim":
-            x_next = ddim_step(model, schedule, x, t, t_next)
-        elif solver == "heun":
-            remaining -= 1
-            use_corrector = remaining > 0
-            x_next = heun_step(model, schedule, x, t, t_next, use_corrector=use_corrector)
-            if use_corrector:
-                remaining -= 1
-        else:
-            eps = model(x, t)
-            drift = schedule.drift(x, t, eps)
-            history.insert(0, drift)
-            order = min(max_order, len(history))
-            coeffs = {
-                1: (1.0,),
-                2: (1.5, -0.5),
-                3: (23.0 / 12.0, -16.0 / 12.0, 5.0 / 12.0),
-            }[order]
-            update = torch.zeros_like(x)
-            for coeff, old_drift in zip(coeffs, history):
-                update = update + coeff * old_drift
-            dt = (t_next - t).view(x.shape[0], *([1] * (x.ndim - 1)))
-            x_next = x + dt * update
-            history = history[:max_order]
+        for bin_index, lambda_start in enumerate(centers):
+            lambda_end = torch.minimum(lambda_start + lambda_step, lambda_lo)
+            t_start_scalar = schedule.inverse_log_snr(lambda_start)
+            t_end_scalar = schedule.inverse_log_snr(lambda_end)
+            t_start = _batch_time(t_start_scalar, x0.shape[0])
+            t_end = _batch_time(t_end_scalar, x0.shape[0])
+            x_start = schedule.q_sample(x0, t_start, path_noise)
+            x_ref = reference_heun_integrate(model, schedule, x_start, t_start, t_end, ref_substeps)
 
-        bin_t = schedule.inverse_log_snr(0.5 * (schedule.log_snr(t[0]) + schedule.log_snr(t_next[0])))
-        bin_index = logsnr_bin_index(schedule, bin_t, time_bins)
-        energy = fft_radial_band_energy(x_next - x_ref, band_spec)
-        sums[bin_index] += energy.sum(dim=0)
-        counts[bin_index] += x.shape[0]
-        x = x_next
+            if solver == "ddim":
+                x_next = ddim_step(model, schedule, x_start, t_start, t_end)
+            elif solver == "heun":
+                x_next = heun_step(model, schedule, x_start, t_start, t_end, use_corrector=True)
+            else:
+                history: list[torch.Tensor] = []
+                for history_index in range(max_order):
+                    lambda_hist = lambda_start - history_index * lambda_step
+                    if lambda_hist < lambda_hi:
+                        break
+                    t_hist_scalar = schedule.inverse_log_snr(lambda_hist)
+                    t_hist = _batch_time(t_hist_scalar, x0.shape[0])
+                    x_hist = schedule.q_sample(x0, t_hist, path_noise)
+                    eps_hist = model(x_hist, t_hist)
+                    history.append(schedule.drift(x_hist, t_hist, eps_hist))
+                coeffs = {
+                    1: (1.0,),
+                    2: (1.5, -0.5),
+                    3: (23.0 / 12.0, -16.0 / 12.0, 5.0 / 12.0),
+                }[len(history)]
+                update = torch.zeros_like(x_start)
+                for coeff, old_drift in zip(coeffs, history):
+                    update = update + coeff * old_drift
+                dt = (t_end - t_start).view(x0.shape[0], *([1] * (x0.ndim - 1)))
+                x_next = x_start + dt * update
 
-    maps = sums / counts.clamp_min(1.0)[:, None]
-    return maps.detach().cpu().numpy(), counts.detach().cpu().numpy()
+            energy = fft_radial_band_energy(x_next - x_ref, band_spec)
+            sums[bin_index] += energy.sum(dim=0)
+            counts[bin_index] += x0.shape[0]
+
+    if seen == 0:
+        raise RuntimeError("No validation samples were available for solver error map computation")
+    return (sums / counts.clamp_min(1.0)[:, None]).detach().cpu().numpy()
 
 
 @torch.no_grad()
@@ -234,7 +260,7 @@ def write_score_tables(output_dir: Path, rows: list[dict[str, float | int | str]
         groups[arch] = [row for row in rows if row["architecture"] == arch]
     for group, group_rows in groups.items():
         y = np.asarray([float(row["delta_fid"]) for row in group_rows])
-        for key in ("total_error", "overlap_score"):
+        for key in ("total_error", "difficulty_weighted_error", "overlap_score"):
             x = np.asarray([float(row[key]) for row in group_rows])
             pearson, spearman = corr_stats(x, y)
             corr_rows.append(
@@ -292,10 +318,11 @@ def plot_outputs(output_dir: Path, architectures: list[str], solvers: list[str],
     fig.savefig(figure_dir / "figure6_solver_error_maps.pdf", dpi=220, bbox_inches="tight")
     plt.close(fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.2))
     for ax, key, title in [
         (axes[0], "total_error", "Total solver error"),
-        (axes[1], "overlap_score", "Overlap score"),
+        (axes[1], "difficulty_weighted_error", "Difficulty-weighted error"),
+        (axes[2], "overlap_score", "Normalized overlap score"),
     ]:
         for solver in solvers:
             selected = [row for row in rows if row["solver"] == solver]
@@ -313,7 +340,7 @@ def plot_outputs(output_dir: Path, architectures: list[str], solvers: list[str],
         ax.set_xlabel(key.replace("_", " "))
         ax.set_ylabel("Delta FID")
         ax.grid(True, alpha=0.25)
-    axes[1].legend(frameon=False, loc="best")
+    axes[-1].legend(frameon=False, loc="best")
     fig.suptitle("Figure 7. Does Overlap Explain Quality?", fontsize=15, weight="bold")
     fig.savefig(figure_dir / "figure7_overlap_explains_quality.png", dpi=220, bbox_inches="tight")
     fig.savefig(figure_dir / "figure7_overlap_explains_quality.pdf", dpi=220, bbox_inches="tight")
@@ -357,30 +384,30 @@ def main() -> None:
         difficulty_maps.append(difficulty)
         d_norm = difficulty / max(float(difficulty.sum()), 1e-12)
 
-        noise_shape = (int(config["model"]["in_channels"]), image_size, image_size)
-        noise_path = args.noise_bank or default_noise_bank_path(
-            config["data"].get("root", "data"), args.seed, args.num_noise, noise_shape
-        )
-        noise_bank = load_or_create_noise_bank(noise_path, num_samples=args.num_noise, shape=noise_shape, seed=args.seed)
         arch_solver_maps = []
         checkpoint_id = f"step_{int(checkpoint.get('step', -1))}_images_{int(checkpoint.get('images_seen', -1))}"
         for solver in args.solvers:
             solver_nfe_maps = []
             for nfe in args.nfe:
                 print(f"BEGIN solver_error architecture={architecture} solver={solver} nfe={nfe}", flush=True)
-                sums = np.zeros((args.time_bins, args.freq_bands), dtype=np.float64)
-                counts = np.zeros((args.time_bins,), dtype=np.float64)
-                for noise in noise_batches(noise_bank, args.batch_size, device):
-                    batch_map, batch_counts = run_solver_error_map(
-                        model, schedule, noise, solver, nfe, args.time_bins, band_spec, args.ref_substeps
-                    )
-                    sums += batch_map * batch_counts[:, None]
-                    counts += batch_counts
-                error_map = sums / np.maximum(counts[:, None], 1.0)
+                error_map = run_fixed_bin_solver_error_map(
+                    model,
+                    schedule,
+                    val_loader,
+                    solver,
+                    nfe,
+                    device,
+                    args.num_noise,
+                    args.time_bins,
+                    band_spec,
+                    args.ref_substeps,
+                    args.seed + 31,
+                )
                 solver_nfe_maps.append(error_map)
                 e_norm = error_map / max(float(error_map.sum()), 1e-12)
                 overlap = float((d_norm * e_norm).sum())
                 total_error = float(error_map.sum())
+                difficulty_weighted_error = float((d_norm * error_map).sum())
                 metrics = metrics_table.get((architecture, solver, nfe), {})
                 score_rows.append(
                     {
@@ -388,7 +415,9 @@ def main() -> None:
                         "solver": solver,
                         "nfe": nfe,
                         "overlap_score": overlap,
+                        "normalized_overlap_score": overlap,
                         "total_error": total_error,
+                        "difficulty_weighted_error": difficulty_weighted_error,
                         "fid": metrics.get("fid", float("nan")),
                         "delta_fid": metrics.get("delta_fid", float("nan")),
                         "wall_clock_sec": metrics.get("wall_clock_sec", float("nan")),
@@ -398,6 +427,8 @@ def main() -> None:
                         "time_bins": args.time_bins,
                         "freq_bands": args.freq_bands,
                         "ref_substeps": args.ref_substeps,
+                        "local_error_probe": "fixed_logsnr_bin_q_path",
+                        "macro_intervals": _macro_intervals(solver, nfe),
                         "checkpoint": str(ckpt),
                         "checkpoint_id": checkpoint_id,
                     }
@@ -405,6 +436,7 @@ def main() -> None:
                 print(
                     f"DONE architecture={architecture} solver={solver} nfe={nfe} "
                     f"overlap={overlap:.6e} total_error={total_error:.6e} "
+                    f"difficulty_weighted_error={difficulty_weighted_error:.6e} "
                     f"delta_fid={metrics.get('delta_fid', float('nan')):.6f}",
                     flush=True,
                 )
