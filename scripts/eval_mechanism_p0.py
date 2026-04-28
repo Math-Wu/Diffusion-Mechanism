@@ -31,8 +31,8 @@ SOLVER_COLORS = {"ddim": "#9a3412", "heun": "#2563eb", "dpmpp": "#15803d", "unip
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate P0 mechanism metrics for CIFAR Result A.")
-    parser.add_argument("--configs", nargs="+", required=True)
-    parser.add_argument("--run_dirs", nargs="+", required=True)
+    parser.add_argument("--configs", nargs="+")
+    parser.add_argument("--run_dirs", nargs="+")
     parser.add_argument("--metrics_csv", default="outputs/result_a_cifar_medium/metrics.csv")
     parser.add_argument("--output_dir", default="outputs/mechanism_p0_cifar_medium")
     parser.add_argument("--checkpoint_name", default="last.pt")
@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--noise_bank", help=argparse.SUPPRESS)
     parser.add_argument("--raw_weights", action="store_true")
+    parser.add_argument("--plot_only", action="store_true", help="Regenerate figures from existing mechanism_maps.npz and scores.")
     return parser.parse_args()
 
 
@@ -279,6 +280,11 @@ def write_score_tables(output_dir: Path, rows: list[dict[str, float | int | str]
         writer.writerows(corr_rows)
 
 
+def read_score_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
 def plot_heatmap(ax, data: np.ndarray, title: str) -> None:
     image = ax.imshow(np.log10(data + 1e-12), aspect="auto", origin="upper", cmap="magma")
     ax.set_title(title, fontsize=12, weight="bold")
@@ -288,6 +294,55 @@ def plot_heatmap(ax, data: np.ndarray, title: str) -> None:
     ax.set_yticks(range(data.shape[0]))
     ax.tick_params(labelsize=7)
     return image
+
+
+def plot_difficulty_residuals(figure_dir: Path, architectures: list[str], difficulty: np.ndarray) -> None:
+    log_difficulty = np.log10(difficulty + 1e-12)
+    log_residual = log_difficulty - log_difficulty.mean(axis=0, keepdims=True)
+    vmax = max(float(np.abs(log_residual).max()), 1e-8)
+    fig, axes = plt.subplots(1, len(architectures), figsize=(4.2 * len(architectures), 3.8))
+    axes = np.atleast_1d(axes)
+    last_image = None
+    for ai, arch in enumerate(architectures):
+        last_image = axes[ai].imshow(log_residual[ai], aspect="auto", origin="upper", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+        axes[ai].set_title(f"{ARCH_LABELS.get(arch, arch)} log residual", fontsize=12, weight="bold")
+        axes[ai].set_xlabel("Radial frequency band")
+        axes[ai].set_ylabel("time bin: noise -> data")
+        axes[ai].set_xticks(range(difficulty.shape[2]))
+        axes[ai].set_yticks(range(difficulty.shape[1]))
+        axes[ai].tick_params(labelsize=7)
+    fig.colorbar(last_image, ax=axes.ravel().tolist(), shrink=0.72, label="log10 D_a - mean_arch log10 D")
+    fig.suptitle("Figure 5b. Difficulty Residual Maps", fontsize=15, weight="bold")
+    fig.savefig(figure_dir / "figure5b_difficulty_residual_maps.png", dpi=220, bbox_inches="tight")
+    fig.savefig(figure_dir / "figure5b_difficulty_residual_maps.pdf", dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+    normalized = difficulty / np.maximum(difficulty.sum(axis=(1, 2), keepdims=True), 1e-12)
+    shape_residual = normalized - normalized.mean(axis=0, keepdims=True)
+    vmax = max(float(np.abs(shape_residual).max()), 1e-12)
+    fig, axes = plt.subplots(1, len(architectures), figsize=(4.2 * len(architectures), 3.8))
+    axes = np.atleast_1d(axes)
+    last_image = None
+    for ai, arch in enumerate(architectures):
+        last_image = axes[ai].imshow(
+            shape_residual[ai] * 1_000.0,
+            aspect="auto",
+            origin="upper",
+            cmap="coolwarm",
+            vmin=-vmax * 1_000.0,
+            vmax=vmax * 1_000.0,
+        )
+        axes[ai].set_title(f"{ARCH_LABELS.get(arch, arch)} shape residual", fontsize=12, weight="bold")
+        axes[ai].set_xlabel("Radial frequency band")
+        axes[ai].set_ylabel("time bin: noise -> data")
+        axes[ai].set_xticks(range(difficulty.shape[2]))
+        axes[ai].set_yticks(range(difficulty.shape[1]))
+        axes[ai].tick_params(labelsize=7)
+    fig.colorbar(last_image, ax=axes.ravel().tolist(), shrink=0.72, label="1e3 * (D_norm,a - mean_arch D_norm)")
+    fig.suptitle("Figure 5c. Difficulty Shape Residual Maps", fontsize=15, weight="bold")
+    fig.savefig(figure_dir / "figure5c_difficulty_shape_residual_maps.png", dpi=220, bbox_inches="tight")
+    fig.savefig(figure_dir / "figure5c_difficulty_shape_residual_maps.pdf", dpi=220, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_outputs(output_dir: Path, architectures: list[str], solvers: list[str], nfes: list[int], difficulty, solver_error, rows) -> None:
@@ -302,6 +357,7 @@ def plot_outputs(output_dir: Path, architectures: list[str], solvers: list[str],
     fig.savefig(figure_dir / "figure5_difficulty_maps.png", dpi=220, bbox_inches="tight")
     fig.savefig(figure_dir / "figure5_difficulty_maps.pdf", dpi=220, bbox_inches="tight")
     plt.close(fig)
+    plot_difficulty_residuals(figure_dir, architectures, difficulty)
 
     nfe_for_error = 20 if 20 in nfes else nfes[len(nfes) // 2]
     fig, axes = plt.subplots(len(architectures), len(solvers), figsize=(3.5 * len(solvers), 3.2 * len(architectures)))
@@ -349,6 +405,24 @@ def plot_outputs(output_dir: Path, architectures: list[str], solvers: list[str],
 
 def main() -> None:
     args = parse_args()
+    if args.plot_only:
+        output_dir = ensure_dir(args.output_dir)
+        maps = np.load(output_dir / "mechanism_maps.npz")
+        rows = read_score_rows(output_dir / "mechanism_scores.csv")
+        plot_outputs(
+            output_dir,
+            [str(item) for item in maps["architectures"]],
+            [str(item) for item in maps["solvers"]],
+            [int(item) for item in maps["nfes"]],
+            maps["difficulty"],
+            maps["solver_error"],
+            rows,
+        )
+        print(f"Regenerated P0 mechanism figures under {output_dir / 'figures'}", flush=True)
+        return
+
+    if args.configs is None or args.run_dirs is None:
+        raise ValueError("--configs and --run_dirs are required unless --plot_only is set")
     if len(args.configs) != len(args.run_dirs):
         raise ValueError("--configs and --run_dirs must have the same length")
     set_seed(args.seed)
