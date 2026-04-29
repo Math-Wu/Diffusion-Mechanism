@@ -20,6 +20,12 @@ inspectable, while following the public designs below.
   it does not require JAX at evaluation time. A `t_ab` implementation is kept
   in the sampler module for parity/debugging, but `rho_ab` is the default
   because it is more stable for this CIFAR cosine-VP setup.
+- OpenAI guided-diffusion ImageNet64 adapter: `src/dm/third_party/guided_diffusion`
+  vendors the minimal MIT-licensed official modules needed to instantiate
+  `64x64_diffusion.pt` for external validation smoke tests.
+- U-ViT ImageNet64 adapter: `src/dm/third_party/uvit_official` vendors the
+  minimal MIT-licensed official `baofff/U-ViT` modules needed to instantiate
+  `imagenet64_uvit_large.pth` for external validation smoke tests.
 
 Before using this scaffold for paper-grade numbers, replace the remaining
 compact sampler kernels with line-by-line vendored official implementations or
