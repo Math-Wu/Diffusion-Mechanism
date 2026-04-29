@@ -13,6 +13,7 @@ from _bootstrap import add_src_to_path
 add_src_to_path()
 
 from dm.analysis import fft_radial_band_energy, logsnr_bin_edges, radial_band_spec
+from dm.eval_utils import load_or_compute_real_stats
 from dm.imagenet64 import build_imagenet64_val_loader, load_imagenet64_pretrained_model
 from dm.metrics import build_feature_extractor, feature_stats, frechet_distance
 from dm.samplers.base import CountedModel, SamplerResult
@@ -25,21 +26,27 @@ SOLVERS = ("ddim", "heun", "dpmpp", "unipc")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Small ImageNet64 pretrained P0/P2/p0_high validation smoke.")
+    parser = argparse.ArgumentParser(description="ImageNet64 pretrained P0/P2/p0_high external validation.")
     parser.add_argument("--data_npz", default="data/imagenet64/Imagenet64_val_npz/val_data.npz")
     parser.add_argument("--adm_checkpoint", default="checkpoints/guided-diffusion/64x64_diffusion.pt")
     parser.add_argument("--uvit_checkpoint", default="checkpoints/u-vit/imagenet64_uvit_large.pth")
     parser.add_argument("--architectures", nargs="+", default=["adm", "uvit"], choices=["adm", "uvit"])
     parser.add_argument("--solvers", nargs="+", default=["ddim", "heun", "dpmpp", "unipc"], choices=SOLVERS)
     parser.add_argument("--nfe", nargs="+", type=int, default=[6, 8])
-    parser.add_argument("--strengths", nargs="+", type=float, default=[0.2, 0.5])
+    parser.add_argument("--strengths", nargs="+", type=float, default=[0.1, 0.2, 0.35, 0.5])
     parser.add_argument("--output_dir", default="outputs/imagenet64_external_smoke")
     parser.add_argument("--num_samples", type=int, default=256)
+    parser.add_argument("--num_real_stats", type=int, default=None)
     parser.add_argument("--num_probe", type=int, default=32)
+    parser.add_argument("--num_p2_paths", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--real_batch_size", type=int, default=64)
     parser.add_argument("--time_bins", type=int, default=8)
     parser.add_argument("--freq_bands", type=int, default=4)
     parser.add_argument("--ref_substeps", type=int, default=2)
+    parser.add_argument("--max_density_ratio", type=float, default=2.5)
+    parser.add_argument("--real_stats_cache")
+    parser.add_argument("--stats_only", action="store_true")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--feature_backend", default="inception", choices=["inception", "pixel"])
     parser.add_argument("--allow_pixel_fallback", action="store_true")
@@ -265,6 +272,32 @@ def _p2_score(model, schedule, labels: torch.Tensor, noise: torch.Tensor, solver
     return {"p2_x0_high_error": x0_high / max(count, 1), "p2_trajectory_drift": drift / max(count, 1)}
 
 
+@torch.no_grad()
+def _p2_score_many(
+    model,
+    schedule,
+    labels: torch.Tensor,
+    noise: torch.Tensor,
+    solver: str,
+    nfe: int,
+    band_spec,
+    ref_substeps: int,
+    batch_size: int,
+    num_paths: int,
+    device: torch.device,
+) -> dict[str, float]:
+    totals = {"p2_x0_high_error": 0.0, "p2_trajectory_drift": 0.0}
+    count = min(num_paths, labels.shape[0], noise.shape[0])
+    for start in range(0, count, batch_size):
+        end = min(start + batch_size, count)
+        batch_labels = labels[start:end].to(device, non_blocking=True)
+        batch_noise = noise[start:end].to(device, non_blocking=True)
+        values = _p2_score(model, schedule, batch_labels, batch_noise, solver, nfe, band_spec, ref_substeps)
+        for key, value in values.items():
+            totals[key] += value * (end - start)
+    return {key: value / max(count, 1) for key, value in totals.items()}
+
+
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     if not rows:
         return
@@ -281,10 +314,25 @@ def main() -> None:
     output_dir = ensure_dir(args.output_dir)
     loader = build_imagenet64_val_loader(args.data_npz, args.batch_size, num_workers=0, shuffle=False)
     extractor = build_feature_extractor(args.feature_backend, device, args.allow_pixel_fallback)
-    real_features = []
-    for x, _y in _limited_batches(loader, args.num_samples, device):
-        real_features.append(extractor(x).detach().float().cpu().numpy())
-    real_stats = feature_stats(np.concatenate(real_features, axis=0)[: args.num_samples])
+    num_real_stats = args.num_real_stats or args.num_samples
+    real_stats_path = Path(args.real_stats_cache) if args.real_stats_cache else output_dir / f"imagenet64_val_{args.feature_backend}_n{num_real_stats}.npz"
+    real_loader = build_imagenet64_val_loader(args.data_npz, args.real_batch_size, num_workers=0, shuffle=False)
+    real_stats = load_or_compute_real_stats(
+        real_stats_path,
+        _limited_batches(real_loader, num_real_stats, device),
+        extractor,
+        device,
+        num_real_stats,
+        metadata={
+            "dataset": "imagenet64_val",
+            "data_npz": args.data_npz,
+            "feature_backend": args.feature_backend,
+            "num_real_stats": num_real_stats,
+        },
+    )
+    print(f"real_stats_cache={real_stats_path} num_real_stats={num_real_stats}", flush=True)
+    if args.stats_only:
+        return
 
     p0_rows: list[dict[str, object]] = []
     p2_rows: list[dict[str, object]] = []
@@ -301,9 +349,10 @@ def main() -> None:
         labels_all = []
         for _x, y in itertools.islice(sample_loader, (args.num_samples + args.batch_size - 1) // args.batch_size):
             labels_all.append(y)
-        labels_all = torch.cat(labels_all, dim=0)[: args.num_samples].to(device)
-        generator = torch.Generator(device=device).manual_seed(args.seed)
-        noise_all = torch.randn(args.num_samples, 3, 64, 64, device=device, generator=generator)
+        labels_all = torch.cat(labels_all, dim=0)[: args.num_samples].contiguous()
+        generator = torch.Generator(device="cpu").manual_seed(args.seed)
+        noise_all = torch.randn(args.num_samples, 3, 64, 64, generator=generator)
+        num_p2_paths = args.num_p2_paths or args.num_probe
 
         for solver in args.solvers:
             for nfe in args.nfe:
@@ -319,14 +368,42 @@ def main() -> None:
                         "difficulty_weighted_error": float((difficulty_norm * error_map).sum()),
                         "p0_high_sum": float(p0_high.sum()),
                         "total_error": float(error_map.sum()),
+                        "num_probe": args.num_probe,
+                        "ref_substeps": args.ref_substeps,
+                        "time_bins": args.time_bins,
+                        "freq_bands": args.freq_bands,
                     }
                 )
-                p2 = _p2_score(model, schedule, labels_all[: args.batch_size], noise_all[: args.batch_size], solver, nfe, band_spec, args.ref_substeps)
-                p2_rows.append({"architecture": architecture, "solver": solver, "nfe": nfe, **p2})
+                p2 = _p2_score_many(
+                    model,
+                    schedule,
+                    labels_all,
+                    noise_all,
+                    solver,
+                    nfe,
+                    band_spec,
+                    args.ref_substeps,
+                    args.batch_size,
+                    num_p2_paths,
+                    device,
+                )
+                p2_rows.append(
+                    {
+                        "architecture": architecture,
+                        "solver": solver,
+                        "nfe": nfe,
+                        "num_p2_paths": num_p2_paths,
+                        "ref_substeps": args.ref_substeps,
+                        **p2,
+                    }
+                )
 
                 intervals = _macro_intervals(solver, nfe)
                 densities = [("uniform", 0.0, np.ones(args.time_bins, dtype=np.float64))]
-                densities.extend(("p0_high", strength, _normalize_profile(p0_high, strength)) for strength in args.strengths)
+                densities.extend(
+                    ("p0_high", strength, _normalize_profile(p0_high, strength, args.max_density_ratio))
+                    for strength in args.strengths
+                )
                 for mode, strength, density in densities:
                     times = _time_grid_from_density(schedule, intervals, density, device)
                     features = []
@@ -336,8 +413,8 @@ def main() -> None:
                         result = _sample_grid(
                             model,
                             schedule,
-                            noise_all[start:end],
-                            labels_all[start:end],
+                            noise_all[start:end].to(device, non_blocking=True),
+                            labels_all[start:end].to(device, non_blocking=True),
                             solver,
                             nfe,
                             times,
@@ -357,8 +434,19 @@ def main() -> None:
                             "fid": fid,
                             "delta_vs_uniform": fid - baseline_fid,
                             "num_samples": args.num_samples,
+                            "num_real_stats": num_real_stats,
                             "num_probe": args.num_probe,
+                            "num_p2_paths": num_p2_paths,
+                            "ref_substeps": args.ref_substeps,
+                            "time_bins": args.time_bins,
+                            "freq_bands": args.freq_bands,
+                            "max_density_ratio": args.max_density_ratio,
+                            "density_min": float(density.min()),
+                            "density_max": float(density.max()),
+                            "density_argmax_bin": int(density.argmax()),
                             "total_model_calls": total_nfe,
+                            "real_stats_cache": str(real_stats_path),
+                            "feature_backend": args.feature_backend,
                         }
                     )
                     print(
