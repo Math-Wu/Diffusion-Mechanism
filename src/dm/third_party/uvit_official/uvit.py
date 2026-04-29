@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import math
 from .timm import trunc_normal_, Mlp
-import einops
 import torch.utils.checkpoint
 
 if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
@@ -39,16 +38,22 @@ def timestep_embedding(timesteps, dim, max_period=10000):
 
 
 def patchify(imgs, patch_size):
-    x = einops.rearrange(imgs, 'B C (h p1) (w p2) -> B (h w) (p1 p2 C)', p1=patch_size, p2=patch_size)
-    return x
+    batch, channels, height, width = imgs.shape
+    h = height // patch_size
+    w = width // patch_size
+    x = imgs.reshape(batch, channels, h, patch_size, w, patch_size)
+    x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+    return x.reshape(batch, h * w, patch_size * patch_size * channels)
 
 
 def unpatchify(x, channels=3):
     patch_size = int((x.shape[2] // channels) ** 0.5)
     h = w = int(x.shape[1] ** .5)
     assert h * w == x.shape[1] and patch_size ** 2 * channels == x.shape[2]
-    x = einops.rearrange(x, 'B (h w) (p1 p2 C) -> B C (h p1) (w p2)', h=h, p1=patch_size, p2=patch_size)
-    return x
+    batch = x.shape[0]
+    x = x.reshape(batch, h, w, patch_size, patch_size, channels)
+    x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+    return x.reshape(batch, channels, h * patch_size, w * patch_size)
 
 
 class Attention(nn.Module):
@@ -68,17 +73,17 @@ class Attention(nn.Module):
 
         qkv = self.qkv(x)
         if ATTENTION_MODE == 'flash':
-            qkv = einops.rearrange(qkv, 'B L (K H D) -> K B H L D', K=3, H=self.num_heads).float()
+            qkv = qkv.reshape(B, L, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).float()
             q, k, v = qkv[0], qkv[1], qkv[2]  # B H L D
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-            x = einops.rearrange(x, 'B H L D -> B L (H D)')
+            x = x.permute(0, 2, 1, 3).contiguous().reshape(B, L, C)
         elif ATTENTION_MODE == 'xformers':
-            qkv = einops.rearrange(qkv, 'B L (K H D) -> K B L H D', K=3, H=self.num_heads)
+            qkv = qkv.reshape(B, L, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
             q, k, v = qkv[0], qkv[1], qkv[2]  # B L H D
             x = xformers.ops.memory_efficient_attention(q, k, v)
-            x = einops.rearrange(x, 'B L H D -> B L (H D)', H=self.num_heads)
+            x = x.reshape(B, L, C)
         elif ATTENTION_MODE == 'math':
-            qkv = einops.rearrange(qkv, 'B L (K H D) -> K B H L D', K=3, H=self.num_heads)
+            qkv = qkv.reshape(B, L, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
             q, k, v = qkv[0], qkv[1], qkv[2]  # B H L D
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
