@@ -478,8 +478,9 @@ def main() -> None:
                     "feature_backend": args.feature_backend,
                 }
             )
+            cap_label = "" if cap is None else f"{cap:g}"
             print(
-                f"uvit heun nfe={nfe} {mode} strength={strength:g} cap={'' if cap is None else cap:g} "
+                f"uvit heun nfe={nfe} {mode} strength={strength:g} cap={cap_label} "
                 f"fid={fid:.4f} delta={delta:.4f}",
                 flush=True,
             )
