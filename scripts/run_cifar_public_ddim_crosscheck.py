@@ -162,9 +162,12 @@ def main() -> None:
     set_seed(args.seed)
     device = default_device()
     output_dir = ensure_dir(args.output_dir)
+    print(f"device={device} output_dir={output_dir}", flush=True)
     schedule = public_cifar_schedule()
+    print(f"building_feature_extractor={args.feature_backend}", flush=True)
     extractor = build_feature_extractor(args.feature_backend, device, args.allow_pixel_fallback)
 
+    print("building_cifar_loaders", flush=True)
     _, val_loader = build_cifar10_loaders(_cifar_config(args, args.batch_size), download=False)
     _, probe_loader = build_cifar10_loaders(_cifar_config(args, args.probe_batch_size), download=False)
     num_real_stats = args.num_real_stats or args.num_samples
@@ -187,8 +190,10 @@ def main() -> None:
             "num_samples": num_real_stats,
         },
     )
+    print(f"real_stats_cache={real_stats_path} num_real_stats={num_real_stats}", flush=True)
     noise_path = args.noise_bank or default_noise_bank_path(args.data_root, args.seed, args.num_samples, (3, 32, 32))
     noise_bank = load_or_create_noise_bank(noise_path, num_samples=args.num_samples, shape=(3, 32, 32), seed=args.seed)
+    print(f"noise_bank={noise_path} noise_bank_id={noise_bank_id(noise_path)}", flush=True)
     labels = torch.zeros(args.num_samples, dtype=torch.long)
     band_spec = radial_band_spec(32, 32, args.freq_bands, device)
     noise_id = noise_bank_id(noise_path)
@@ -201,13 +206,17 @@ def main() -> None:
 
     for model_name in args.models:
         checkpoint = _checkpoint_for_model(args, model_name)
+        print(f"loading_model={model_name} checkpoint={checkpoint}", flush=True)
         model = build_public_cifar_model(model_name, checkpoint, device)
+        print(f"loaded_model={model_name}", flush=True)
         difficulty = _difficulty_map(model, schedule, probe_loader, args.num_probe, args.time_bins, band_spec, device)
+        print(f"computed_difficulty={model_name}", flush=True)
         difficulty_norm = difficulty / max(float(difficulty.sum()), 1e-12)
         maps_payload[f"{model_name}_difficulty"] = difficulty
         maps_payload[f"{model_name}_difficulty_norm"] = difficulty_norm
 
         for nfe in args.nfe:
+            print(f"computing_p0 model={model_name} nfe={nfe}", flush=True)
             error_map = _solver_error_map(
                 model,
                 schedule,
