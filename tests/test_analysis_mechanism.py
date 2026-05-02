@@ -8,7 +8,14 @@ pytestmark = pytest.mark.skipif(importlib.util.find_spec("torch") is None, reaso
 
 import torch
 
-from dm.analysis import fft_radial_band_energy, logsnr_bin_centers, logsnr_bin_index, radial_band_spec
+from dm.analysis import (
+    fft_radial_band_energy,
+    high_band_slice,
+    logsnr_bin_centers,
+    logsnr_bin_index,
+    radial_band_spec,
+    radial_power_profile,
+)
 from dm.schedules import CosineVPSchedule
 
 
@@ -18,6 +25,15 @@ def test_fft_radial_band_energy_conserves_l2_energy():
     band_energy = fft_radial_band_energy(x, spec).sum(dim=1)
     pixel_energy = x.square().sum(dim=(1, 2, 3))
     assert torch.allclose(band_energy, pixel_energy, rtol=1e-5, atol=1e-4)
+
+
+def test_radial_power_profile_matches_l2_energy():
+    x = torch.randn(3, 3, 16, 16)
+    profile = radial_power_profile(x, num_bins=6)
+    assert profile.energy.shape == (3, 6)
+    assert profile.mean_power.shape == (3, 6)
+    assert torch.allclose(profile.energy.sum(dim=1), x.square().sum(dim=(1, 2, 3)), rtol=1e-5, atol=1e-4)
+    assert high_band_slice(4) == slice(3, 4)
 
 
 def test_logsnr_bin_centers_are_valid_and_indexable():
