@@ -13,6 +13,8 @@ from _bootstrap import add_src_to_path
 add_src_to_path()
 
 from dm.imagenet256 import decode_latents, imagenet256_schedule, load_autoencoder_kl, load_imagenet256_model
+from dm.eval_utils import load_or_create_noise_bank, noise_bank_id
+from dm.metrics import FeatureStats, build_feature_extractor, feature_stats, frechet_distance
 from dm.samplers.base import SamplerResult
 from dm.samplers.ode import AB_COEFFS
 from dm.utils import default_device, ensure_dir, set_seed
@@ -35,8 +37,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--solvers", nargs="+", default=list(SOLVERS), choices=SOLVERS)
     parser.add_argument("--nfe", nargs="+", type=int, default=[4, 6, 8])
     parser.add_argument("--num_samples", type=int, default=1024)
+    parser.add_argument("--num_real_stats", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--real_batch_size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--noise_bank")
+    parser.add_argument("--real_npz", default="data/imagenet256/ref_batches/VIRTUAL_imagenet256_labeled.npz")
+    parser.add_argument("--real_stats_cache")
+    parser.add_argument("--stats_only", action="store_true")
+    parser.add_argument("--feature_backend", default="inception", choices=["inception", "pixel"])
+    parser.add_argument("--allow_pixel_fallback", action="store_true")
+    parser.add_argument("--delta_reference", default="best_observed", choices=["best_observed", "none"])
     parser.add_argument("--grid_samples", type=int, default=64)
     parser.add_argument("--grid_nrow", type=int, default=8)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -157,6 +168,83 @@ def _save_grid(path: Path, images: torch.Tensor, nrow: int) -> None:
     save_image((images.clamp(-1, 1) + 1.0) * 0.5, path, nrow=nrow)
 
 
+def _default_noise_bank_path(model_name: str, seed: int, num_samples: int, shape: tuple[int, int, int]) -> Path:
+    shape_tag = "x".join(str(value) for value in shape)
+    return Path("data/noise_banks") / f"imagenet256_{model_name}_seed{seed}_n{num_samples}_{shape_tag}.pt"
+
+
+def _default_real_stats_path(feature_backend: str, num_samples: int) -> Path:
+    return Path("data/fid_stats") / f"imagenet256_val_{feature_backend}_n{num_samples}.npz"
+
+
+def _real_image_batches_from_npz(npz_path: str | Path, total: int, batch_size: int):
+    data = np.load(npz_path, allow_pickle=False)
+    if "arr_0" not in data:
+        raise ValueError(f"{npz_path} does not contain arr_0 real image array")
+    images = data["arr_0"]
+    if images.ndim != 4:
+        raise ValueError(f"Expected arr_0 to be rank-4, got shape {images.shape}")
+    count = min(total, images.shape[0])
+    for start in range(0, count, batch_size):
+        batch = images[start : min(start + batch_size, count)]
+        tensor = torch.from_numpy(np.ascontiguousarray(batch))
+        if tensor.shape[-1] == 3:
+            tensor = tensor.permute(0, 3, 1, 2)
+        tensor = tensor.float().div(127.5).sub(1.0)
+        yield tensor
+
+
+def _load_imagenet256_real_stats(
+    *,
+    npz_path: str | Path,
+    cache_path: str | Path,
+    extractor: torch.nn.Module,
+    device: torch.device,
+    num_samples: int,
+    batch_size: int,
+    feature_backend: str,
+) -> FeatureStats:
+    cache_path = Path(cache_path)
+    if cache_path.exists():
+        data = np.load(cache_path, allow_pickle=False)
+        return FeatureStats(mu=data["mu"], sigma=data["sigma"])
+    features: list[np.ndarray] = []
+    seen = 0
+    for batch in _real_image_batches_from_npz(npz_path, num_samples, batch_size):
+        batch = batch.to(device, non_blocking=True)
+        features.append(extractor(batch).detach().float().cpu().numpy())
+        seen += batch.shape[0]
+        print(f"real_stats_progress {seen}/{num_samples}", flush=True)
+    stats = feature_stats(np.concatenate(features, axis=0)[:num_samples])
+    ensure_dir(cache_path.parent)
+    np.savez(
+        cache_path,
+        mu=stats.mu,
+        sigma=stats.sigma,
+        dataset="imagenet256_val",
+        real_npz=str(npz_path),
+        feature_backend=feature_backend,
+        num_samples=num_samples,
+    )
+    return stats
+
+
+def _update_delta_fid(rows: list[dict[str, object]], mode: str) -> None:
+    if not rows:
+        return
+    if mode == "none":
+        for row in rows:
+            row["delta_fid"] = float("nan")
+            row["reference_fid"] = float("nan")
+            row["delta_reference"] = "none"
+        return
+    best_fid = min(float(row["fid"]) for row in rows)
+    for row in rows:
+        row["delta_fid"] = float(row["fid"]) - best_fid
+        row["reference_fid"] = best_fid
+        row["delta_reference"] = "best_observed_same_architecture"
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -164,6 +252,22 @@ def main() -> None:
     output_dir = ensure_dir(args.output_dir)
     grid_dir = ensure_dir(output_dir / "sample_grids")
     print(f"imagenet256_sweep_start model={args.model} device={device} output_dir={output_dir}", flush=True)
+    extractor = build_feature_extractor(args.feature_backend, device, args.allow_pixel_fallback)
+    num_real_stats = args.num_real_stats or args.num_samples
+    real_stats_path = args.real_stats_cache or _default_real_stats_path(args.feature_backend, num_real_stats)
+    real_stats = _load_imagenet256_real_stats(
+        npz_path=args.real_npz,
+        cache_path=real_stats_path,
+        extractor=extractor,
+        device=device,
+        num_samples=num_real_stats,
+        batch_size=args.real_batch_size,
+        feature_backend=args.feature_backend,
+    )
+    print(f"real_stats_cache={real_stats_path} num_real_stats={num_real_stats}", flush=True)
+    if args.stats_only:
+        return
+
     schedule = imagenet256_schedule()
     model = load_imagenet256_model(args.model, args.checkpoint, device)
     vae = None
@@ -173,8 +277,9 @@ def main() -> None:
         vae = load_autoencoder_kl(args.vae_dir, device)
 
     shape = MODEL_SHAPES[args.model]
-    generator = torch.Generator(device="cpu").manual_seed(args.seed)
-    noise_bank = torch.randn(args.num_samples, *shape, generator=generator)
+    noise_path = args.noise_bank or _default_noise_bank_path(args.model, args.seed, args.num_samples, shape)
+    noise_bank = load_or_create_noise_bank(noise_path, num_samples=args.num_samples, shape=shape, seed=args.seed)
+    noise_id = noise_bank_id(noise_path)
     labels = (torch.arange(args.num_samples, dtype=torch.long) % 1000).contiguous()
     rows: list[dict[str, object]] = []
     amp_enabled = bool(args.amp and device.type == "cuda")
@@ -190,17 +295,23 @@ def main() -> None:
             pixel_sq_sum = 0.0
             pixel_min = float("inf")
             pixel_max = float("-inf")
+            sampling_runtime = 0.0
+            features: list[np.ndarray] = []
             grid_images: list[torch.Tensor] = []
             for start in range(0, args.num_samples, args.batch_size):
                 end = min(start + args.batch_size, args.num_samples)
                 noise = noise_bank[start:end].to(device, non_blocking=True)
                 y = labels[start:end].to(device, non_blocking=True)
+                sample_start = time.time()
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                     result = sample_grid(model, schedule, noise, y, solver, nfe)
                     samples = result.samples
                     if vae is not None:
                         samples = decode_latents(vae, samples, scale_factor=args.latent_scale_factor)
-                samples_f = samples.detach().float().cpu()
+                sampling_runtime += time.time() - sample_start
+                samples = samples.detach().float()
+                features.append(extractor(samples).detach().float().cpu().numpy())
+                samples_f = samples.cpu()
                 total_calls += result.nfe
                 total_finite += int(torch.isfinite(samples_f).sum().item())
                 total_pixels += int(samples_f.numel())
@@ -215,17 +326,25 @@ def main() -> None:
             mean = pixel_sum / max(total_pixels, 1)
             variance = max(pixel_sq_sum / max(total_pixels, 1) - mean * mean, 0.0)
             finite_fraction = total_finite / max(total_pixels, 1)
+            fid = frechet_distance(real_stats, feature_stats(np.concatenate(features, axis=0)[: args.num_samples]))
             grid_path = grid_dir / f"{args.model}_{solver}_nfe{nfe}.png"
             if grid_images:
                 _save_grid(grid_path, torch.cat(grid_images, dim=0), args.grid_nrow)
             row = {
+                "architecture": args.model,
                 "model": args.model,
                 "solver": solver,
                 "nfe": nfe,
+                "fid": fid,
+                "delta_fid": float("nan"),
+                "reference_fid": float("nan"),
+                "delta_reference": args.delta_reference,
                 "num_samples": args.num_samples,
+                "num_real_stats": num_real_stats,
                 "batch_size": args.batch_size,
-                "wall_clock_sec": elapsed,
-                "sec_per_sample": elapsed / max(args.num_samples, 1),
+                "wall_clock_sec": sampling_runtime,
+                "total_elapsed_sec": elapsed,
+                "sec_per_sample": sampling_runtime / max(args.num_samples, 1),
                 "nfe_per_sample": nfe,
                 "model_call_batches": total_calls,
                 "finite_fraction": finite_fraction,
@@ -236,14 +355,21 @@ def main() -> None:
                 "checkpoint": args.checkpoint,
                 "vae_dir": args.vae_dir or "",
                 "seed": args.seed,
+                "noise_bank_id": noise_id,
+                "noise_bank": str(noise_path),
+                "real_npz": str(args.real_npz),
+                "real_stats_cache": str(real_stats_path),
+                "feature_backend": args.feature_backend,
                 "grid_path": str(grid_path),
-                "metric_note": "sampling_only_no_imagenet256_real_stats",
+                "metric_note": "imagenet256_pretrained_torchvision_inception_proxy_fid",
             }
             rows.append(row)
+            _update_delta_fid(rows, args.delta_reference)
             _write_csv(output_dir / "metrics.csv", rows)
             print(
                 f"sweep_point_done model={args.model} solver={solver} nfe={nfe} "
-                f"sec={elapsed:.2f} finite={finite_fraction:.6f} mean={mean:.4f} std={row['pixel_std']:.4f}",
+                f"fid={fid:.4f} delta={row['delta_fid']:.4f} sample_sec={sampling_runtime:.2f} "
+                f"total_sec={elapsed:.2f} finite={finite_fraction:.6f} mean={mean:.4f} std={row['pixel_std']:.4f}",
                 flush=True,
             )
     print(output_dir / "metrics.csv", flush=True)
