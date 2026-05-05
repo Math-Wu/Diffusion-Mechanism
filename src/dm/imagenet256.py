@@ -28,6 +28,13 @@ def _clean_state_dict(state):
     return state
 
 
+def _torch_load_checkpoint(path: str | Path):
+    try:
+        return torch.load(path, map_location="cpu", mmap=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 class ADM256EpsWrapper(nn.Module):
     """OpenAI guided-diffusion ImageNet256 class-conditional ADM wrapper."""
 
@@ -109,7 +116,7 @@ def load_imagenet256_model(name: str, checkpoint_path: str | Path, device: torch
         model = UViT256LatentEpsWrapper()
     else:
         raise ValueError(f"Unknown ImageNet256 model: {name}")
-    state = _clean_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+    state = _clean_state_dict(_torch_load_checkpoint(checkpoint_path))
     model.model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
