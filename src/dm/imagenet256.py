@@ -143,5 +143,10 @@ def load_autoencoder_kl(vae_dir: str | Path, device: torch.device) -> nn.Module:
 @torch.no_grad()
 def decode_latents(vae: nn.Module, latents: torch.Tensor, scale_factor: float = 0.18215) -> torch.Tensor:
     decoded = vae.decode(latents / scale_factor)
-    images = decoded.sample if hasattr(decoded, "sample") else decoded[0]
+    if isinstance(decoded, torch.Tensor):
+        images = decoded
+    elif hasattr(decoded, "sample"):
+        images = decoded.sample
+    else:
+        images = decoded[0]
     return images.clamp(-1.0, 1.0)
