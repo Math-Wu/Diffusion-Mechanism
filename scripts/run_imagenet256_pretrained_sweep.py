@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import time
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -178,20 +179,36 @@ def _default_real_stats_path(feature_backend: str, num_samples: int) -> Path:
 
 
 def _real_image_batches_from_npz(npz_path: str | Path, total: int, batch_size: int):
-    data = np.load(npz_path, allow_pickle=False)
-    if "arr_0" not in data:
-        raise ValueError(f"{npz_path} does not contain arr_0 real image array")
-    images = data["arr_0"]
-    if images.ndim != 4:
-        raise ValueError(f"Expected arr_0 to be rank-4, got shape {images.shape}")
-    count = min(total, images.shape[0])
-    for start in range(0, count, batch_size):
-        batch = images[start : min(start + batch_size, count)]
-        tensor = torch.from_numpy(np.ascontiguousarray(batch))
-        if tensor.shape[-1] == 3:
-            tensor = tensor.permute(0, 3, 1, 2)
-        tensor = tensor.float().div(127.5).sub(1.0)
-        yield tensor
+    with zipfile.ZipFile(npz_path) as archive:
+        member = "arr_0.npy" if "arr_0.npy" in archive.namelist() else "arr_0"
+        if member not in archive.namelist():
+            raise ValueError(f"{npz_path} does not contain arr_0 real image array")
+        with archive.open(member) as handle:
+            version = np.lib.format.read_magic(handle)
+            if version == (1, 0):
+                shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(handle)
+            elif version == (2, 0):
+                shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(handle)
+            else:
+                shape, fortran_order, dtype = np.lib.format._read_array_header(handle, version)
+            if fortran_order:
+                raise ValueError(f"{npz_path}:{member} uses Fortran order, which is not supported")
+            if len(shape) != 4:
+                raise ValueError(f"Expected arr_0 to be rank-4, got shape {shape}")
+            count = min(total, int(shape[0]))
+            item_shape = tuple(int(value) for value in shape[1:])
+            row_bytes = int(np.dtype(dtype).itemsize * np.prod(item_shape))
+            for start in range(0, count, batch_size):
+                rows = min(batch_size, count - start)
+                raw = handle.read(rows * row_bytes)
+                if len(raw) != rows * row_bytes:
+                    raise EOFError(f"Unexpected EOF while reading {npz_path}:{member}")
+                batch = np.frombuffer(raw, dtype=dtype).reshape((rows, *item_shape))
+                tensor = torch.from_numpy(np.ascontiguousarray(batch))
+                if tensor.shape[-1] == 3:
+                    tensor = tensor.permute(0, 3, 1, 2)
+                tensor = tensor.float().div(127.5).sub(1.0)
+                yield tensor
 
 
 def _load_imagenet256_real_stats(
