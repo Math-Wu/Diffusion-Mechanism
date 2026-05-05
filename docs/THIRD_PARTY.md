@@ -26,6 +26,12 @@ inspectable, while following the public designs below.
 - U-ViT ImageNet64 adapter: `src/dm/third_party/uvit_official` vendors the
   minimal MIT-licensed official `baofff/U-ViT` modules needed to instantiate
   `imagenet64_uvit_large.pth` for external validation smoke tests.
+- ImageNet256 pretrained adapters: `src/dm/third_party/dit_official.py` mirrors
+  the official Meta DiT model structure for `DiT-XL/2`, while
+  `src/dm/third_party/uvit_official/autoencoder.py` adapts the official U-ViT
+  Stable-Diffusion-style AutoencoderKL decoder for latent ImageNet256 samples.
+  OpenAI ADM256 uses the vendored guided-diffusion U-Net module with the
+  official 256x256 class-conditional configuration.
 
 Before using this scaffold for paper-grade numbers, replace the remaining
 compact sampler kernels with line-by-line vendored official implementations or
