@@ -96,7 +96,7 @@ class UViT256LatentEpsWrapper(nn.Module):
             mlp_time_embed=False,
             num_classes=1001,
             use_checkpoint=False,
-            conv=False,
+            conv=True,
         )
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
