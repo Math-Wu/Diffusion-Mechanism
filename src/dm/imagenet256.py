@@ -142,7 +142,12 @@ def load_autoencoder_kl(vae_dir: str | Path, device: torch.device) -> nn.Module:
 
 @torch.no_grad()
 def decode_latents(vae: nn.Module, latents: torch.Tensor, scale_factor: float = 0.18215) -> torch.Tensor:
-    decoded = vae.decode(latents / scale_factor)
+    # Diffusers AutoencoderKL expects manually unscaled latents. The U-ViT
+    # decoder adapter mirrors the official code and applies its own scale.
+    if vae.__class__.__name__ == "FrozenAutoencoderKLDecoder":
+        decoded = vae.decode(latents)
+    else:
+        decoded = vae.decode(latents / scale_factor)
     if isinstance(decoded, torch.Tensor):
         images = decoded
     elif hasattr(decoded, "sample"):
