@@ -28,7 +28,15 @@ from run_imagenet256_pretrained_sweep import _default_noise_bank_path, _real_ima
 
 
 SAMPLERS = ("euler", "heun", "rk2")
-GRIDS = ("uniform", "official", "p0_high", "curvature_high")
+GRIDS = (
+    "uniform",
+    "official",
+    "p0_high",
+    "curvature_high",
+    "terminal_hi",
+    "d_flow_high",
+    "terminal_hi_d_flow",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time_bins", type=int, default=16)
     parser.add_argument("--freq_bands", type=int, default=8)
     parser.add_argument("--ref_substeps", type=int, default=4)
+    parser.add_argument("--terminal_ref_substeps", type=int, default=4)
     parser.add_argument("--profile_strength", type=float, default=0.5)
     parser.add_argument("--max_density_ratio", type=float, default=2.5)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
@@ -72,8 +81,13 @@ def parse_args() -> argparse.Namespace:
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     if not rows:
         return
+    fieldnames = list(rows[0].keys())
+    for row in rows[1:]:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -329,19 +343,23 @@ def _density_coverage(real_features: np.ndarray, fake_features: np.ndarray, k: i
 @torch.no_grad()
 def _profile_maps(
     model,
+    vae,
     probe_noise: torch.Tensor,
     labels: torch.Tensor,
     sampler: str,
     args: argparse.Namespace,
-    band_spec,
+    latent_band_spec,
+    image_band_spec,
     device: torch.device,
     amp_enabled: bool,
+    needs_terminal_profile: bool,
 ) -> dict[str, np.ndarray]:
     bins = args.time_bins
     freq = args.freq_bands
     edges = torch.linspace(0.0, 1.0, bins + 1, device=device)
     local_error = torch.zeros(bins, freq, device=device)
     curvature = torch.zeros(bins, freq, device=device)
+    terminal_error = torch.zeros(bins, freq, device=device)
     velocity_rms = torch.zeros(bins, device=device)
     counts = torch.zeros(bins, device=device)
     batch_size = args.probe_batch_size or args.batch_size
@@ -356,15 +374,47 @@ def _profile_maps(
             x_solver_next = _flow_step(model, x, t, t_next, y, sampler, args.cfg_scale, amp_enabled, device)
             v_start = _velocity(model, x, t, y, args.cfg_scale, amp_enabled, device)
             v_end = _velocity(model, x_ref_next, t_next, y, args.cfg_scale, amp_enabled, device)
-            local_error[bin_index] += fft_radial_band_energy(x_solver_next - x_ref_next, band_spec).sum(dim=0)
-            curvature[bin_index] += fft_radial_band_energy(v_end - v_start, band_spec).sum(dim=0)
+            local_error[bin_index] += fft_radial_band_energy(x_solver_next - x_ref_next, latent_band_spec).sum(dim=0)
+            curvature[bin_index] += fft_radial_band_energy(v_end - v_start, latent_band_spec).sum(dim=0)
             velocity_rms[bin_index] += v_start.flatten(1).square().mean(dim=1).sqrt().sum()
+            if needs_terminal_profile:
+                if bin_index == bins - 1:
+                    x_ref_terminal = x_ref_next
+                    x_solver_terminal = x_solver_next
+                else:
+                    t_end = _batch_time(edges[-1], x.shape[0])
+                    x_ref_terminal = _reference_heun(
+                        model,
+                        x_ref_next,
+                        t_next,
+                        t_end,
+                        y,
+                        args.terminal_ref_substeps,
+                        args.cfg_scale,
+                        amp_enabled,
+                        device,
+                    )
+                    x_solver_terminal = _reference_heun(
+                        model,
+                        x_solver_next,
+                        t_next,
+                        t_end,
+                        y,
+                        args.terminal_ref_substeps,
+                        args.cfg_scale,
+                        amp_enabled,
+                        device,
+                    )
+                ref_img = _decode(vae, x_ref_terminal, args.latent_scale_factor, amp_enabled, device)
+                solver_img = _decode(vae, x_solver_terminal, args.latent_scale_factor, amp_enabled, device)
+                terminal_error[bin_index] += fft_radial_band_energy(solver_img - ref_img, image_band_spec).sum(dim=0)
             counts[bin_index] += x.shape[0]
             x = x_ref_next
     denom = counts.clamp_min(1.0)
     return {
         "local_error": (local_error / denom[:, None]).detach().cpu().numpy(),
         "curvature": (curvature / denom[:, None]).detach().cpu().numpy(),
+        "terminal_error": (terminal_error / denom[:, None]).detach().cpu().numpy(),
         "velocity_rms": (velocity_rms / denom).detach().cpu().numpy(),
     }
 
@@ -402,6 +452,13 @@ def _high_slice(freq_bands: int) -> slice:
     return slice(max(0, int(math.ceil(freq_bands * 0.625))), freq_bands)
 
 
+def _mean_normalize(values: np.ndarray) -> np.ndarray:
+    values = np.clip(np.asarray(values, dtype=np.float64), 0.0, None)
+    if float(values.sum()) <= 1e-12:
+        return np.ones_like(values, dtype=np.float64)
+    return values / max(float(values.mean()), 1e-12)
+
+
 def _density_for_grid(grid: str, profile: dict[str, np.ndarray], args: argparse.Namespace) -> tuple[np.ndarray, str]:
     if grid in {"uniform", "official"}:
         return np.ones(args.time_bins, dtype=np.float64), "official_sit_uniform_time" if grid == "official" else "uniform_time"
@@ -412,6 +469,17 @@ def _density_for_grid(grid: str, profile: dict[str, np.ndarray], args: argparse.
     if grid == "curvature_high":
         p = np.asarray(profile["curvature"], dtype=np.float64)[:, high].sum(axis=1)
         return _normalize_profile(p, args.profile_strength, args.max_density_ratio), "latent_velocity_curvature_high_frequency"
+    if grid == "terminal_hi":
+        p = np.asarray(profile["terminal_error"], dtype=np.float64)[:, high].sum(axis=1)
+        return _normalize_profile(p, args.profile_strength, args.max_density_ratio), "decoded_terminal_high_frequency_error"
+    if grid == "d_flow_high":
+        p = np.asarray(profile["velocity_rms"], dtype=np.float64)
+        return _normalize_profile(p, args.profile_strength, args.max_density_ratio), "velocity_rms_transport_activity"
+    if grid == "terminal_hi_d_flow":
+        terminal = np.asarray(profile["terminal_error"], dtype=np.float64)[:, high].sum(axis=1)
+        d_flow = np.asarray(profile["velocity_rms"], dtype=np.float64)
+        p = 0.5 * _mean_normalize(terminal) + 0.5 * _mean_normalize(d_flow)
+        return _normalize_profile(p, args.profile_strength, args.max_density_ratio), "decoded_terminal_high_frequency_error_plus_velocity_rms"
     raise ValueError(f"Unknown grid: {grid}")
 
 
@@ -434,6 +502,7 @@ def _correlation_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     predictors = [
         "trajectory_drift",
         "density_weighted_local_high_error",
+        "density_weighted_terminal_high_error",
         "density_weighted_curvature_high",
         "density_weighted_d_flow",
         "fdd",
@@ -517,6 +586,8 @@ def main() -> None:
     labels = (torch.arange(args.num_samples, dtype=torch.long) % 1000).contiguous()
     probe_labels = (torch.arange(args.num_probe, dtype=torch.long) % 1000).contiguous()
     latent_band_spec = radial_band_spec(shape[-2], shape[-1], args.freq_bands, device)
+    image_band_spec = radial_band_spec(256, 256, args.freq_bands, device)
+    needs_terminal_profile = any(grid in {"terminal_hi", "terminal_hi_d_flow"} for grid in args.grids)
     metrics_path = output_dir / "metrics.csv"
     density_path = output_dir / "timegrid_density.csv"
     mechanism_path = output_dir / "mechanism_scores.csv"
@@ -532,19 +603,29 @@ def main() -> None:
             profile_cache[sampler] = {
                 "local_error": payload["local_error"],
                 "curvature": payload["curvature"],
+                "terminal_error": payload["terminal_error"] if "terminal_error" in payload else np.zeros((args.time_bins, args.freq_bands), dtype=np.float64),
                 "velocity_rms": payload["velocity_rms"],
             }
+            if needs_terminal_profile and "terminal_error" not in payload:
+                print(f"profile_recompute_missing_terminal sampler={sampler}", flush=True)
+                profile_path.unlink()
+                profile_cache.pop(sampler)
         else:
+            profile_cache.pop(sampler, None)
+        if sampler not in profile_cache:
             print(f"profile_start sampler={sampler}", flush=True)
             profile_cache[sampler] = _profile_maps(
                 model,
+                vae,
                 probe_noise,
                 probe_labels,
                 sampler,
                 args,
                 latent_band_spec,
+                image_band_spec,
                 device,
                 amp_enabled,
+                needs_terminal_profile,
             )
             np.savez_compressed(profile_path, **profile_cache[sampler])
             print(f"profile_done sampler={sampler} cache={profile_path}", flush=True)
@@ -622,6 +703,7 @@ def main() -> None:
                 profile = profile_cache[sampler]
                 weights = density / max(float(density.sum()), 1e-12)
                 local_high = np.asarray(profile["local_error"])[:, high].sum(axis=1)
+                terminal_high = np.asarray(profile["terminal_error"])[:, high].sum(axis=1)
                 curvature_high = np.asarray(profile["curvature"])[:, high].sum(axis=1)
                 d_flow = np.asarray(profile["velocity_rms"])
                 grid_path = grid_dir / f"sit_xl_2_{sampler}_{grid}_nfe{nfe}.png"
@@ -647,6 +729,7 @@ def main() -> None:
                     "finite_fraction": total_finite / max(total_pixels, 1),
                     "trajectory_drift": trajectory_drift,
                     "density_weighted_local_high_error": float((weights * local_high).sum()),
+                    "density_weighted_terminal_high_error": float((weights * terminal_high).sum()),
                     "density_weighted_curvature_high": float((weights * curvature_high).sum()),
                     "density_weighted_d_flow": float((weights * d_flow).sum()),
                     "density_min": float(density.min()),
@@ -661,6 +744,7 @@ def main() -> None:
                     "density_k": args.density_k,
                     "num_probe": args.num_probe,
                     "ref_substeps": args.ref_substeps,
+                    "terminal_ref_substeps": args.terminal_ref_substeps,
                     "cfg_scale": args.cfg_scale,
                     "checkpoint": args.checkpoint,
                     "vae_dir": args.vae_dir,
