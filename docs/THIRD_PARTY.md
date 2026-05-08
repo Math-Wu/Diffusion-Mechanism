@@ -32,6 +32,10 @@ inspectable, while following the public designs below.
   Stable-Diffusion-style AutoencoderKL decoder for latent ImageNet256 samples.
   OpenAI ADM256 uses the vendored guided-diffusion U-Net module with the
   official 256x256 class-conditional configuration.
+- SiT / Rectified-flow ImageNet256 adapter: `src/dm/third_party/sit_official.py`
+  mirrors the MIT-licensed official `willisma/SiT` SiT-XL/2 architecture and
+  uses its velocity-output convention for the public `SiT-XL-2-256.pt`
+  checkpoint.
 
 Before using this scaffold for paper-grade numbers, replace the remaining
 compact sampler kernels with line-by-line vendored official implementations or
