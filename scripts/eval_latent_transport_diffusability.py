@@ -326,6 +326,55 @@ def _score_index(rows: list[dict[str, str]]) -> dict[tuple[str, str, int], dict[
     }
 
 
+def _resolve_latent_p2_model_dir(latent_p2_root: Path, model: str) -> Path:
+    candidates = [
+        latent_p2_root / f"imagenet256_p2_{model}",
+        Path("outputs") / f"imagenet256_p2_{model}",
+    ]
+    for candidate in candidates:
+        if (candidate / "trajectory_maps.npz").exists():
+            return candidate
+    return candidates[0]
+
+
+def _load_latent_score_rows(args: argparse.Namespace) -> list[dict[str, str]]:
+    path = Path(args.latent_p2_scores)
+    if path.exists():
+        return _read_csv(path)
+    rows: list[dict[str, str]] = []
+    for model in args.models:
+        model_dir = _resolve_latent_p2_model_dir(Path(args.latent_p2_root), model)
+        score_path = model_dir / "trajectory_scores.csv"
+        if score_path.exists():
+            rows.extend(_read_csv(score_path))
+    if not rows:
+        raise FileNotFoundError(f"Could not find latent P2 scores at {path} or per-model trajectory_scores.csv files")
+    return rows
+
+
+def _load_decoded_score_rows(args: argparse.Namespace) -> list[dict[str, str]]:
+    path = Path(args.decoded_p2_scores)
+    if path.exists():
+        return _read_csv(path)
+    rows: list[dict[str, str]] = []
+    search_roots = [path.parent.parent if path.parent.name == "combined_analysis" else path.parent, Path("outputs")]
+    seen: set[Path] = set()
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for model in args.models:
+            for score_path in sorted(root.glob(f"imagenet256_decoded_x0_p2_{model}_*/decoded_x0_frequency_scores.csv")):
+                if score_path in seen:
+                    continue
+                seen.add(score_path)
+                rows.extend(_read_csv(score_path))
+    if not rows:
+        raise FileNotFoundError(
+            f"Could not find decoded P2 scores at {path} or per-solver decoded_x0_frequency_scores.csv files"
+        )
+    return rows
+
+
 def _bin_count_weights(path: Path, solver: str, nfe: int, time_bins: int) -> np.ndarray:
     weights = np.zeros(time_bins, dtype=np.float64)
     if not path.exists():
@@ -340,7 +389,7 @@ def _bin_count_weights(path: Path, solver: str, nfe: int, time_bins: int) -> np.
 
 
 def _weighted_latent_band_profile(latent_p2_root: Path, model: str, solver: str, nfe: int) -> np.ndarray:
-    model_dir = latent_p2_root / f"imagenet256_p2_{model}"
+    model_dir = _resolve_latent_p2_model_dir(latent_p2_root, model)
     maps = np.load(model_dir / "trajectory_maps.npz", allow_pickle=False)
     solvers = [str(item) for item in maps["solvers"]]
     nfes = [int(item) for item in maps["nfes"]]
@@ -393,8 +442,8 @@ def _decoder_weighted_predictors(
 
 def analyze_latent_transport(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
-    latent_rows = _read_csv(Path(args.latent_p2_scores))
-    decoded_index = _score_index(_read_csv(Path(args.decoded_p2_scores)))
+    latent_rows = _load_latent_score_rows(args)
+    decoded_index = _score_index(_load_decoded_score_rows(args))
     score_rows: list[dict[str, object]] = []
     summary_rows: list[dict[str, object]] = []
     for model in args.models:
